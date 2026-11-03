@@ -2738,6 +2738,15 @@ pub struct Replay {
     #[clap(long)]
     pub(crate) skip_comparison: bool,
 
+    /// Write a value trace of the replayed execution to this file.
+    ///
+    /// The trace is NDJSON in the Move trace format (version 3): every frame opened and
+    /// closed, every instruction executed with its pc and remaining gas, and the values each
+    /// instruction pushes, pops, reads and writes. It covers the whole transaction: prologue,
+    /// payload and epilogue.
+    #[clap(long, value_name = "PATH")]
+    pub(crate) trace: Option<PathBuf>,
+
     /// Key to use for ratelimiting purposes with the node API. This value will be used
     /// as `Authorization: Bearer <key>`
     #[clap(long)]
@@ -2958,6 +2967,21 @@ impl CliCommand<TransactionSummary> for Replay {
             (None, None)
         };
 
+        if let Some(path) = &self.trace {
+            if self.benchmark {
+                return Err(CliError::UnexpectedError(
+                    "Cannot trace and benchmark a transaction at the same time.".to_string(),
+                ));
+            }
+            move_vm_runtime::value_tracing::enable_value_tracing(path).map_err(|err| {
+                CliError::UnexpectedError(format!(
+                    "Cannot write value trace to {}: {}",
+                    path.display(),
+                    err
+                ))
+            })?;
+        }
+
         // Execute the transaction.
         let (vm_status, vm_output) = if self.profile_gas {
             println!("Profiling transaction...");
@@ -2999,6 +3023,24 @@ impl CliCommand<TransactionSummary> for Replay {
                 aux_info,
             )?
         };
+
+        if let Some(path) = &self.trace {
+            let trace = move_vm_runtime::value_tracing::finish_value_tracing().map_err(|err| {
+                CliError::UnexpectedError(format!(
+                    "Cannot write value trace to {}: {}",
+                    path.display(),
+                    err
+                ))
+            })?;
+            if let Some(trace) = trace {
+                eprintln!(
+                    "Wrote value trace to {} ({} events, {} instructions)",
+                    path.display(),
+                    trace.events,
+                    trace.instructions
+                );
+            }
+        }
 
         // Materialize into transaction output and check if the outputs match.
         let txn_output = vm_output.into_transaction_output().map_err(|err| {
