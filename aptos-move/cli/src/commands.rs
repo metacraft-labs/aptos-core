@@ -3024,6 +3024,10 @@ impl CliCommand<TransactionSummary> for Replay {
             )?
         };
 
+        // The `MOVE_VM_TRACE` writer is buffered and never dropped: flush it so the trace
+        // reaches its file before the process exits.
+        move_vm_runtime::tracing::flush_tracing_buffer();
+
         if let Some(path) = &self.trace {
             let trace = move_vm_runtime::value_tracing::finish_value_tracing().map_err(|err| {
                 CliError::UnexpectedError(format!(
