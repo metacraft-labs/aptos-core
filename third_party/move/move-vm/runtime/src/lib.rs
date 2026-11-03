@@ -21,6 +21,7 @@ pub mod native_extensions;
 pub mod native_functions;
 #[macro_use]
 pub mod tracing;
+pub mod value_tracing;
 pub mod config;
 pub mod module_traversal;
 
