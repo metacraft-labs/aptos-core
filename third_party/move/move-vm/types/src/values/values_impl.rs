@@ -2637,6 +2637,19 @@ impl Locals {
         res
     }
 
+    /// Visits the value of local `idx` in place, without copying or borrowing it. Returns
+    /// `false` if the local holds no value.
+    pub fn visit_loc(&self, idx: usize, visitor: &mut impl ValueVisitor) -> PartialVMResult<bool> {
+        let locals = self.0.borrow();
+        match locals.get(idx) {
+            Some(Value::Invalid) | None => Ok(false),
+            Some(value) => {
+                value.visit_impl(visitor, 0)?;
+                Ok(true)
+            },
+        }
+    }
+
     #[cfg_attr(feature = "inline-locals", inline(always))]
     pub fn is_invalid(&self, idx: usize) -> PartialVMResult<bool> {
         let locals = self.0.borrow();

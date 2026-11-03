@@ -25,7 +25,9 @@ use crate::{
         loader::traits::Loader, ty_depth_checker::TypeDepthChecker,
         ty_layout_converter::LayoutConverter,
     },
-    tracing, LoadedFunction, RuntimeEnvironment,
+    tracing,
+    value_tracing::{self, TraceCtx, TraceTypeResolver},
+    LoadedFunction, RuntimeEnvironment,
 };
 use fail::fail_point;
 use itertools::Itertools;
@@ -157,6 +159,8 @@ pub(crate) struct InterpreterImpl<'ctx, LoaderImpl> {
     layout_converter: &'ctx LayoutConverter<'ctx, LoaderImpl>,
     /// State maintained for dynamic reference checks.
     ref_state: RefCheckState,
+    /// Whether execution is being recorded by [value_tracing].
+    value_tracing: bool,
 }
 
 struct TypeWithRuntimeEnvironment<'a, 'b> {
@@ -234,15 +238,21 @@ where
             ty_depth_checker,
             layout_converter,
             ref_state: RefCheckState::new(extensions.get_native_runtime_ref_checks_model()),
+            value_tracing: value_tracing::is_value_tracing_enabled(),
         };
 
         // Tracing and runtime checks (full or partial) are mutually exclusive because if we record
         // the trace, the checks are done after execution via abstract interpretation during trace
         // replay.
-        let paranoid_type_checks =
-            !trace_recorder.is_enabled() && interpreter.vm_config.paranoid_type_checks;
-        let optimize_trusted_code =
-            !trace_recorder.is_enabled() && interpreter.vm_config.optimize_trusted_code;
+        //
+        // Value tracing renders values with their types, so it runs with full type checks,
+        // which keep the type of every stack slot and local.
+        let value_tracing = interpreter.value_tracing;
+        let paranoid_type_checks = value_tracing
+            || (!trace_recorder.is_enabled() && interpreter.vm_config.paranoid_type_checks);
+        let optimize_trusted_code = !value_tracing
+            && !trace_recorder.is_enabled()
+            && interpreter.vm_config.optimize_trusted_code;
         let paranoid_ref_checks = interpreter.vm_config.paranoid_ref_checks;
 
         let function = Rc::new(function);
@@ -262,7 +272,7 @@ where
         }
 
         // Note: we have organized the code below from most-likely config to least-likely config.
-        match (
+        let result = match (
             paranoid_type_checks,
             optimize_trusted_code,
             paranoid_ref_checks,
@@ -273,6 +283,21 @@ where
             (true, false, true) => execute_main!(FullRuntimeTypeCheck, FullRuntimeRefCheck),
             (false, _, false) => execute_main!(NoRuntimeTypeCheck, NoRuntimeRefCheck),
             (false, _, true) => execute_main!(NoRuntimeTypeCheck, FullRuntimeRefCheck),
+        };
+        if value_tracing {
+            value_tracing::finish_entrypoint(&result, gas_meter.balance_internal().into());
+        }
+        result
+    }
+
+    /// The interpreter state a [value_tracing] hook sees while `current` executes.
+    fn trace_ctx<'a>(&'a self, current: &'a Frame, gas_left: u64) -> TraceCtx<'a> {
+        TraceCtx {
+            resolver: self,
+            stack: &self.operand_stack,
+            callers: &self.call_stack.0,
+            current,
+            gas_left,
         }
     }
 
@@ -377,6 +402,11 @@ where
         .map_err(|err| self.set_location(err))?;
 
         trace_recorder.record_entrypoint(current_frame.function.as_ref());
+        if self.value_tracing {
+            value_tracing::open_frame(
+                &self.trace_ctx(&current_frame, gas_meter.balance_internal().into()),
+            );
+        }
         loop {
             let exit_code = current_frame
                 .execute_code::<RTTCheck, RTRCheck>(
@@ -390,6 +420,11 @@ where
 
             match exit_code {
                 ExitCode::Return => {
+                    if self.value_tracing {
+                        value_tracing::close_frame(
+                            &self.trace_ctx(&current_frame, gas_meter.balance_internal().into()),
+                        );
+                    }
                     let non_ref_vals = current_frame.locals.drop_all_values();
 
                     gas_meter
@@ -511,6 +546,14 @@ where
                         .map_err(|e| set_err_info!(current_frame, e))?;
 
                     if function.is_native() {
+                        if self.value_tracing {
+                            value_tracing::open_native(
+                                &self
+                                    .trace_ctx(&current_frame, gas_meter.balance_internal().into()),
+                                &function,
+                                function.param_tys().len(),
+                            );
+                        }
                         let dispatched = self.call_native::<RTTCheck, RTRCheck>(
                             &mut current_frame,
                             data_cache,
@@ -522,6 +565,14 @@ where
                             ClosureMask::empty(),
                             vec![],
                         )?;
+                        if self.value_tracing {
+                            value_tracing::close_native(
+                                &self
+                                    .trace_ctx(&current_frame, gas_meter.balance_internal().into()),
+                                &function,
+                                dispatched,
+                            );
+                        }
                         trace_recorder.record_successful_instruction(&Instruction::Call(fh_idx));
                         if dispatched {
                             trace_recorder.record_entrypoint(&current_frame.function)
@@ -539,6 +590,11 @@ where
                         ClosureMask::empty(),
                         vec![],
                     )?;
+                    if self.value_tracing {
+                        value_tracing::open_frame(
+                            &self.trace_ctx(&current_frame, gas_meter.balance_internal().into()),
+                        );
+                    }
                     trace_recorder.record_successful_instruction(&Instruction::Call(fh_idx));
                 },
                 ExitCode::CallGeneric(idx) => {
@@ -633,6 +689,14 @@ where
                         .map_err(|e| set_err_info!(current_frame, e))?;
 
                     if function.is_native() {
+                        if self.value_tracing {
+                            value_tracing::open_native(
+                                &self
+                                    .trace_ctx(&current_frame, gas_meter.balance_internal().into()),
+                                &function,
+                                function.param_tys().len(),
+                            );
+                        }
                         let dispatched = self.call_native::<RTTCheck, RTRCheck>(
                             &mut current_frame,
                             data_cache,
@@ -644,6 +708,14 @@ where
                             ClosureMask::empty(),
                             vec![],
                         )?;
+                        if self.value_tracing {
+                            value_tracing::close_native(
+                                &self
+                                    .trace_ctx(&current_frame, gas_meter.balance_internal().into()),
+                                &function,
+                                dispatched,
+                            );
+                        }
                         trace_recorder
                             .record_successful_instruction(&Instruction::CallGeneric(idx));
                         if dispatched {
@@ -662,6 +734,11 @@ where
                         ClosureMask::empty(),
                         vec![],
                     )?;
+                    if self.value_tracing {
+                        value_tracing::open_frame(
+                            &self.trace_ctx(&current_frame, gas_meter.balance_internal().into()),
+                        );
+                    }
                     trace_recorder.record_successful_instruction(&Instruction::CallGeneric(idx));
                 },
                 ExitCode::CallClosure(sig_idx) => {
@@ -769,6 +846,14 @@ where
 
                     // Call function
                     if callee.is_native() {
+                        if self.value_tracing {
+                            value_tracing::open_native(
+                                &self
+                                    .trace_ctx(&current_frame, gas_meter.balance_internal().into()),
+                                &callee,
+                                num_actual_params,
+                            );
+                        }
                         let dispatched = self.call_native::<RTTCheck, RTRCheck>(
                             &mut current_frame,
                             data_cache,
@@ -780,6 +865,14 @@ where
                             mask,
                             captured_vec,
                         )?;
+                        if self.value_tracing {
+                            value_tracing::close_native(
+                                &self
+                                    .trace_ctx(&current_frame, gas_meter.balance_internal().into()),
+                                &callee,
+                                dispatched,
+                            );
+                        }
                         // If we call a dispatchable native, we need to record first the closure
                         // call, and then the target where it redirects to (which at this point
                         // has to be set as the current frame's function).
@@ -805,6 +898,12 @@ where
                             mask,
                             captured_vec,
                         )?;
+                        if self.value_tracing {
+                            value_tracing::open_frame(
+                                &self
+                                    .trace_ctx(&current_frame, gas_meter.balance_internal().into()),
+                            );
+                        }
                         trace_recorder
                             .record_successful_instruction(&Instruction::CallClosure(sig_idx));
                         trace_recorder.record_call_closure(current_frame.function.as_ref(), mask);
@@ -2104,19 +2203,29 @@ impl Frame {
         let frame_cache = &mut *self.frame_cache.borrow_mut();
 
         let enable_debugging = interpreter.vm_config.enable_debugging;
+        let value_tracing = interpreter.value_tracing;
+        let instruction_hooks = enable_debugging || value_tracing;
 
         let code = self.function.code();
         loop {
             for instruction in &code[self.pc as usize..] {
-                if enable_debugging {
-                    tracing::debug_trace(
-                        &self.function,
-                        &self.locals,
-                        self.pc,
-                        instruction,
-                        interpreter.loader.runtime_environment(),
-                        interpreter,
-                    );
+                if instruction_hooks {
+                    if enable_debugging {
+                        tracing::debug_trace(
+                            &self.function,
+                            &self.locals,
+                            self.pc,
+                            instruction,
+                            interpreter.loader.runtime_environment(),
+                            interpreter,
+                        );
+                    }
+                    if value_tracing {
+                        value_tracing::before_instruction(
+                            &interpreter.trace_ctx(self, gas_meter.balance_internal().into()),
+                            instruction,
+                        );
+                    }
                 }
 
                 fail_point!("move_vm::interpreter_loop", |_| {
@@ -3284,4 +3393,38 @@ fn closure_signature_mismatch_error(
         function_name, num_expected_params, num_expected_results, num_actual_params, num_actual_results
     ));
     err.with_sub_status(EPARANOID_FAILURE)
+}
+
+impl<LoaderImpl> TraceTypeResolver for InterpreterImpl<'_, LoaderImpl>
+where
+    LoaderImpl: Loader,
+{
+    fn annotated_layout(
+        &self,
+        ty: &Type,
+    ) -> Option<triomphe::Arc<move_core_types::value::MoveTypeLayout>> {
+        // Computed outside the transaction's metering and traversal: the tracer must not
+        // change what execution observes or is charged.
+        let storage = crate::module_traversal::TraversalStorage::new();
+        let mut traversal_context = TraversalContext::new(&storage);
+        self.layout_converter
+            .type_to_annotated_type_layout_with_delayed_fields(
+                &mut move_vm_types::gas::UnmeteredGasMeter,
+                &mut traversal_context,
+                ty,
+            )
+            .ok()
+            .map(|layout| layout.unpack().0)
+    }
+
+    fn type_tag(&self, ty: &Type) -> Option<TypeTag> {
+        self.loader.runtime_environment().ty_to_ty_tag(ty).ok()
+    }
+
+    fn instantiate(&self, ty: &Type, ty_args: &[Type]) -> Option<Type> {
+        self.vm_config
+            .ty_builder
+            .create_ty_with_subst(ty, ty_args)
+            .ok()
+    }
 }
