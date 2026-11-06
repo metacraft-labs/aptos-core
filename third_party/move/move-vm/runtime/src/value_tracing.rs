@@ -383,8 +383,8 @@ impl ValueTracer {
         loc: Option<&Loc>,
     ) -> String {
         let (is_mut, inner_ty) = match ty {
-            Some(Type::MutableReference(inner)) => (true, Some(inner.as_ref())),
-            Some(Type::Reference(inner)) => (false, Some(inner.as_ref())),
+            Some(Type::MutableReference(inner)) => (true, Some(inner.ty())),
+            Some(Type::Reference(inner)) => (false, Some(inner.ty())),
             other => (false, other),
         };
         let is_ref = is_ref || matches!(ty, Some(Type::Reference(_) | Type::MutableReference(_)));
@@ -448,8 +448,8 @@ impl ValueTracer {
 
     fn local_type_json(&self, resolver: &dyn TraceTypeResolver, ty: &Type) -> String {
         let (inner, ref_type) = match ty {
-            Type::Reference(inner) => (inner.as_ref(), "\"Imm\""),
-            Type::MutableReference(inner) => (inner.as_ref(), "\"Mut\""),
+            Type::Reference(inner) => (inner.ty(), "\"Imm\""),
+            Type::MutableReference(inner) => (inner.ty(), "\"Mut\""),
             other => (other, "null"),
         };
         format!(
